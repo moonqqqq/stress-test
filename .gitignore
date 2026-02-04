@@ -1,1 +1,3 @@
 .claude
+/stress-test-app/dist
+/stress-test-app/node_modules
