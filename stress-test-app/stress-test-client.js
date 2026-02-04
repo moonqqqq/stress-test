@@ -1,24 +1,24 @@
 /**
- * SSE Backpressure Stress Test Client
- *
- * 핵심: 클라이언트가 데이터를 느리게 읽어서 서버의 write 버퍼가 쌓이게 함
+ * SSE Channel Subscription Stress Test Client
  *
  * 사용법:
- *   node stress-test-client.js [connections] [readDelay]
+ *   node stress-test-client.js [channelId] [connections] [readDelay]
  *
  * 예시:
- *   node stress-test-client.js 100 100    # 100 연결, 100ms마다 읽기
- *   node stress-test-client.js 50 500     # 50 연결, 500ms마다 읽기 (더 느림)
+ *   node stress-test-client.js channel1 10 500   # channel1에 10개 연결, 500ms 딜레이
+ *   node stress-test-client.js myChannel 5 1000  # myChannel에 5개 연결, 1초 딜레이
  */
 
 const http = require('http');
 
-const NUM_CONNECTIONS = parseInt(process.argv[2]) || 100;
-const READ_DELAY_MS = parseInt(process.argv[3]) || 100; // 클라이언트가 데이터 읽는 딜레이
+const CHANNEL_ID = process.argv[2] || 'default';
+const NUM_CONNECTIONS = parseInt(process.argv[3]) || 10;
+const READ_DELAY_MS = parseInt(process.argv[4]) || 500;
 
 console.log(`========================================`);
-console.log(`SSE Backpressure Stress Test`);
+console.log(`SSE Channel Subscription Stress Test`);
 console.log(`========================================`);
+console.log(`Channel: ${CHANNEL_ID}`);
 console.log(`Connections: ${NUM_CONNECTIONS}`);
 console.log(`Read Delay: ${READ_DELAY_MS}ms (느릴수록 서버 버퍼 증가)`);
 console.log(`========================================\n`);
@@ -32,7 +32,7 @@ function createSlowConnection(id) {
       {
         hostname: 'localhost',
         port: 3000,
-        path: '/sse/stream?chunkSize=1024&interval=10', // 1MB, 10ms 간격
+        path: `/sse/subscribe/${CHANNEL_ID}?bufferSize=1024&interval=10`,
         method: 'GET',
         headers: {
           Accept: 'text/event-stream',
@@ -40,12 +40,11 @@ function createSlowConnection(id) {
       },
       (res) => {
         connectedCount++;
-        console.log(`[Client ${id}] Connected (${connectedCount}/${NUM_CONNECTIONS})`);
+        console.log(`[Client ${id}] Connected to channel: ${CHANNEL_ID} (${connectedCount}/${NUM_CONNECTIONS})`);
 
         let bytesReceived = 0;
         let isPaused = false;
 
-        // 핵심: 데이터가 오면 일시정지하고, 딜레이 후에 다시 읽기
         res.on('data', (chunk) => {
           bytesReceived += chunk.length;
           totalBytesReceived += chunk.length;
@@ -86,14 +85,14 @@ function createSlowConnection(id) {
   });
 }
 
-// 더 극단적인 버전: 연결만 하고 아예 안 읽음
+// 연결만 하고 아예 안 읽는 좀비 클라이언트
 function createZombieConnection(id) {
   return new Promise((resolve) => {
     const req = http.request(
       {
         hostname: 'localhost',
         port: 3000,
-        path: '/sse/stream-aggressive',
+        path: `/sse/subscribe/${CHANNEL_ID}?bufferSize=1024&interval=10`,
         method: 'GET',
         headers: {
           Accept: 'text/event-stream',
@@ -106,13 +105,7 @@ function createZombieConnection(id) {
         // 데이터를 전혀 읽지 않음 - 서버 버퍼가 계속 쌓임
         res.pause();
 
-        // 가끔씩만 상태 확인
-        const checker = setInterval(() => {
-          console.log(`[Zombie ${id}] Still connected, not reading...`);
-        }, 5000);
-
         res.on('close', () => {
-          clearInterval(checker);
           connectedCount--;
         });
 
@@ -129,69 +122,10 @@ function createZombieConnection(id) {
   });
 }
 
-// Redis Pub/Sub 시뮬레이션 테스트: @Sse + Subject 조합
-function createRedisConnection(id) {
-  return new Promise((resolve) => {
-    const req = http.request(
-      {
-        hostname: 'localhost',
-        port: 3000,
-        path: '/sse/stream-redis',
-        method: 'GET',
-        headers: {
-          Accept: 'text/event-stream',
-        },
-      },
-      (res) => {
-        connectedCount++;
-        console.log(`[Redis ${id}] Connected - SLOW READING (Push-based source)`);
-
-        let bytesReceived = 0;
-        let isPaused = false;
-
-        res.on('data', (chunk) => {
-          bytesReceived += chunk.length;
-          totalBytesReceived += chunk.length;
-
-          // 느리게 읽기
-          if (!isPaused) {
-            isPaused = true;
-            res.pause();
-            setTimeout(() => {
-              isPaused = false;
-              res.resume();
-            }, READ_DELAY_MS);
-          }
-        });
-
-        res.on('close', () => {
-          console.log(`[Redis ${id}] Closed - Received: ${Math.round(bytesReceived / 1024 / 1024)}MB`);
-          connectedCount--;
-        });
-
-        resolve({ id, req, res });
-      },
-    );
-
-    req.on('error', (err) => {
-      console.error(`[Redis ${id}] Failed: ${err.message}`);
-      resolve(null);
-    });
-
-    req.end();
-  });
-}
-
 async function runStressTest() {
-  const mode = process.argv[4] || 'slow';
-
-  const modeLabels = {
-    slow: 'SLOW (delayed read)',
-    zombie: 'ZOMBIE (no read)',
-    redis: 'REDIS (push-based source + slow read)',
-  };
-  console.log(`Mode: ${modeLabels[mode] || mode}\n`);
-  console.log(`Starting ${NUM_CONNECTIONS} connections...\n`);
+  const mode = process.argv[5] || 'slow';
+  console.log(`Mode: ${mode === 'zombie' ? 'ZOMBIE (no read)' : 'SLOW (delayed read)'}\n`);
+  console.log(`Starting ${NUM_CONNECTIONS} connections to channel: ${CHANNEL_ID}...\n`);
 
   const connections = [];
 
@@ -199,30 +133,27 @@ async function runStressTest() {
     let conn;
     if (mode === 'zombie') {
       conn = await createZombieConnection(i);
-    } else if (mode === 'redis') {
-      conn = await createRedisConnection(i);
     } else {
       conn = await createSlowConnection(i);
     }
 
     if (conn) connections.push(conn);
 
-    // 10개씩 그룹으로 연결
-    if (i % 10 === 0) {
+    if (i % 5 === 0) {
       console.log(`--- ${i}/${NUM_CONNECTIONS} connections established ---`);
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
 
   console.log(`\n========================================`);
-  console.log(`All ${connectedCount} connections active!`);
+  console.log(`All ${connectedCount} connections active on channel: ${CHANNEL_ID}`);
   console.log(`Press Ctrl+C to stop.`);
   console.log(`========================================\n`);
 
   // 상태 모니터링
   setInterval(() => {
     console.log(
-      `[Monitor] Active: ${connectedCount} | Total received: ${Math.round(totalBytesReceived / 1024 / 1024)}MB`,
+      `[Monitor] Channel: ${CHANNEL_ID} | Active: ${connectedCount} | Total received: ${Math.round(totalBytesReceived / 1024 / 1024)}MB`,
     );
   }, 2000);
 }

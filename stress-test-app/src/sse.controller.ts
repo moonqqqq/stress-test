@@ -1,181 +1,154 @@
-import { Controller, Sse, Query, MessageEvent, OnModuleInit } from '@nestjs/common';
-import { Observable, interval, map, tap, ReplaySubject, takeWhile } from 'rxjs';
+import { Controller, Sse, Query, Param, MessageEvent, OnModuleInit } from '@nestjs/common';
+import { Observable, Subject } from 'rxjs';
 
 @Controller('sse')
 export class SseController implements OnModuleInit {
   private connectionCount = 0;
 
-  // Redis Pub/Sub 시뮬레이션 - 외부에서 계속 데이터를 푸시
-  // ReplaySubject: 버퍼에 모든 이벤트를 저장 → OOM 발생!
-  private redisPubSub$ = new ReplaySubject<MessageEvent>(Infinity);
-  private redisSimulatorRunning = false;
+  // 채널별 Redis Pub/Sub 구독 시뮬레이션
+  // 각 채널(id)마다 Subject를 생성하여 데이터를 push
+  private channels: Map<string, Subject<MessageEvent>> = new Map();
 
-  // 서버 시작 시 바로 Redis 시뮬레이터 시작 (구독자 없어도 데이터 쌓임)
+  // 연결된 클라이언트 수 추적
+  private activeClients: Set<number> = new Set();
+
   onModuleInit() {
-    console.log('[SseController] Starting Redis simulator on server init...');
-    this.startRedisSimulator();
+    console.log('[SseController] Server started');
+    console.log('[SseController] Waiting for client subscriptions...');
   }
 
   /**
-   * Backpressure를 무시하고 데이터를 계속 보내는 SSE 엔드포인트
-   * @Sse 데코레이터를 사용한 RxJS Observable 기반 구현
+   * 채널 구독 엔드포인트
+   * GET /sse/subscribe/:id
+   *
+   * 클라이언트가 특정 채널을 구독하면:
+   * 1. 해당 채널이 없으면 생성 + Redis 시뮬레이터 시작
+   * 2. 클라이언트별 버퍼 생성
+   * 3. 채널 데이터를 SSE로 전송
    */
-  @Sse('stream')
-  stream(
-    @Query('chunkSize') chunkSizeKB: string = '1024', // 기본 1MB
+  @Sse('subscribe/:id')
+  subscribe(
+    @Param('id') channelId: string,
+    @Query('bufferSize') bufferSizeKB: string = '1024', // 기본 1MB per message
     @Query('interval') intervalMs: string = '10', // 기본 10ms
   ): Observable<MessageEvent> {
     const connectionId = ++this.connectionCount;
-    const chunkSize = parseInt(chunkSizeKB) * 1024; // KB to bytes
-    const intervalTime = parseInt(intervalMs);
+    const bufferSize = parseInt(bufferSizeKB) * 1024;
+    const interval = parseInt(intervalMs);
 
-    console.log(
-      `[${connectionId}] New connection - Chunk: ${chunkSizeKB}KB, Interval: ${intervalMs}ms`,
-    );
+    console.log(`[Client ${connectionId}] Subscribing to channel: ${channelId}`);
+    console.log(`[Client ${connectionId}] Buffer size: ${bufferSizeKB}KB, Interval: ${intervalMs}ms`);
+
+    // 채널이 없으면 생성하고 Redis 시뮬레이터 시작
+    if (!this.channels.has(channelId)) {
+      this.createChannel(channelId, bufferSize, interval);
+    }
+
+    // 해당 채널의 Subject를 구독
+    const channel$ = this.channels.get(channelId)!;
+    this.activeClients.add(connectionId);
 
     let eventCount = 0;
-    let totalBytesSent = 0;
-    let isActive = true;
 
-    // 큰 데이터 청크 생성 (한 번만 생성하여 재사용)
-    const payload = 'x'.repeat(chunkSize);
+    return new Observable<MessageEvent>((observer) => {
+      console.log(`[Client ${connectionId}] Connected to channel: ${channelId}`);
 
-    return interval(intervalTime).pipe(
-      takeWhile(() => isActive),
-      map(() => {
-        eventCount++;
-        const data = {
-          event: eventCount,
-          size: chunkSize,
-          timestamp: Date.now(),
-          payload: payload,
-        };
+      const subscription = channel$.subscribe({
+        next: (event) => {
+          eventCount++;
+          // SSE로 바로 전송 (클라이언트가 느리면 Node.js 내부 write buffer에 쌓임 → OOM!)
+          observer.next(event);
 
-        totalBytesSent += JSON.stringify(data).length;
-
-        return { data } as MessageEvent;
-      }),
-      tap(() => {
-        // 메모리 상태 로깅 (매 100개 이벤트마다)
-        if (eventCount % 100 === 0) {
-          const mem = process.memoryUsage();
-          console.log(
-            `[${connectionId}] Events: ${eventCount} | ` +
-              `Sent: ${Math.round(totalBytesSent / 1024 / 1024)}MB | ` +
+          // 로깅
+          if (eventCount % 100 === 0) {
+            const mem = process.memoryUsage();
+            console.log(
+              `[Client ${connectionId}] Sent: ${eventCount} events | ` +
               `Heap: ${Math.round(mem.heapUsed / 1024 / 1024)}MB | ` +
-              `RSS: ${Math.round(mem.rss / 1024 / 1024)}MB`,
-          );
-        }
-      }),
-    );
+              `RSS: ${Math.round(mem.rss / 1024 / 1024)}MB`
+            );
+          }
+        },
+        error: (err) => observer.error(err),
+      });
+
+      // 연결 종료 시 정리
+      return () => {
+        console.log(`[Client ${connectionId}] Disconnected from channel: ${channelId}`);
+        subscription.unsubscribe();
+        this.activeClients.delete(connectionId);
+      };
+    });
   }
 
   /**
-   * 더 공격적인 버전 - 초고속 전송
-   * @Sse 데코레이터를 사용한 RxJS Observable 기반 구현
+   * 채널 생성 및 Redis Pub/Sub 시뮬레이션 시작
+   * 실제로는 Redis에서 데이터가 들어오지만, 여기서는 시뮬레이션
    */
-  @Sse('stream-aggressive')
-  streamAggressive(): Observable<MessageEvent> {
-    const connectionId = ++this.connectionCount;
-    console.log(`[${connectionId}] AGGRESSIVE connection started`);
+  private createChannel(channelId: string, bufferSize: number, intervalMs: number) {
+    console.log(`[Channel ${channelId}] Creating new channel...`);
+
+    // 일반 Subject: 내부 버퍼 없음
+    // 하지만 클라이언트가 느리면 Node.js HTTP response의 write buffer에 쌓임 → OOM!
+    const channel$ = new Subject<MessageEvent>();
+    this.channels.set(channelId, channel$);
 
     let eventCount = 0;
-    let totalBytes = 0;
 
-    // 5MB 청크
-    const chunkSize = 5 * 1024 * 1024;
-    const payload = 'A'.repeat(chunkSize);
-
-    // 1ms 간격으로 이벤트 전송
-    return interval(1).pipe(
-      map(() => {
-        const data = {
-          event: eventCount++,
-          ts: Date.now(),
-          data: payload,
-        };
-
-        totalBytes += JSON.stringify(data).length;
-
-        return { data } as MessageEvent;
-      }),
-      tap(() => {
-        // 매 10개 이벤트마다 로깅
-        if (eventCount % 10 === 0) {
-          const mem = process.memoryUsage();
-          console.log(
-            `[${connectionId}] Blasted ${eventCount} events | ` +
-              `Total: ${Math.round(totalBytes / 1024 / 1024)}MB | ` +
-              `Heap: ${Math.round(mem.heapUsed / 1024 / 1024)}MB | ` +
-              `RSS: ${Math.round(mem.rss / 1024 / 1024)}MB`,
-          );
-        }
-      }),
-    );
-  }
-
-  /**
-   * Redis Pub/Sub 시뮬레이션 - Push 기반 데이터 소스
-   * 클라이언트가 느려도 데이터가 계속 들어옴 → OOM 발생!
-   */
-  @Sse('stream-redis')
-  streamRedis(): Observable<MessageEvent> {
-    const connectionId = ++this.connectionCount;
-    console.log(`[${connectionId}] Redis Pub/Sub client connected`);
-
-    // ReplaySubject: 지금까지 쌓인 모든 이벤트 + 새 이벤트를 전달
-    // 클라이언트가 느리면 계속 쌓여서 OOM!
-    return this.redisPubSub$.asObservable();
-  }
-
-  /**
-   * Redis에서 데이터가 계속 들어오는 것을 시뮬레이션
-   * 1ms마다 1MB 데이터 push
-   */
-  private startRedisSimulator() {
-    this.redisSimulatorRunning = true;
-    console.log('[Redis Simulator] Started - pushing 1MB every 1ms');
-
-    const chunkSize = 1024 * 1024; // 1MB
-    let eventCount = 0;
-
-    // 이벤트들을 명시적으로 저장하는 배열 (ReplaySubject 대신 직접 관리)
-    const eventBuffer: any[] = [];
-
+    // Redis Pub/Sub 시뮬레이션 - 주기적으로 데이터 push
     const pushData = () => {
       eventCount++;
 
-      // ⚠️ Buffer.alloc으로 실제 메모리 할당 (V8 최적화 우회)
-      const payload = Buffer.alloc(chunkSize, eventCount % 256);
+      // 큰 데이터 생성 (Buffer.alloc으로 실제 메모리 할당)
+      const payload = Buffer.alloc(bufferSize, eventCount % 256);
 
-      const event = {
+      const event: MessageEvent = {
         data: {
+          channel: channelId,
           event: eventCount,
-          source: 'redis-pubsub',
-          ts: Date.now(),
+          timestamp: Date.now(),
           payloadSize: payload.length,
-          // payload를 base64로 변환해서 저장 (실제 메모리 사용 보장)
           payload: payload.toString('base64'),
         },
       };
 
-      // 명시적으로 버퍼에 저장 (GC 방지)
-      eventBuffer.push(event);
-
-      this.redisPubSub$.next(event as MessageEvent);
+      channel$.next(event);
 
       // 매 100개마다 로깅
       if (eventCount % 100 === 0) {
         const mem = process.memoryUsage();
         console.log(
-          `[Redis Simulator] Pushed ${eventCount} events | ` +
-            `Heap: ${Math.round(mem.heapUsed / 1024 / 1024)}MB | ` +
-            `RSS: ${Math.round(mem.rss / 1024 / 1024)}MB`,
+          `[Channel ${channelId}] Pushed ${eventCount} events | ` +
+          `Heap: ${Math.round(mem.heapUsed / 1024 / 1024)}MB | ` +
+          `RSS: ${Math.round(mem.rss / 1024 / 1024)}MB`
         );
       }
     };
 
-    // 1ms마다 데이터 push (초당 1000개 × 1MB = 1GB/s)
-    setInterval(pushData, 1);
+    // 주기적으로 데이터 push (클라이언트가 느려도 계속 push → OOM!)
+    setInterval(pushData, intervalMs);
+
+    console.log(`[Channel ${channelId}] Redis simulator started - pushing ${bufferSize / 1024}KB every ${intervalMs}ms`);
+  }
+
+  /**
+   * 현재 상태 확인용 엔드포인트
+   */
+  @Sse('status')
+  status(): Observable<MessageEvent> {
+    return new Observable<MessageEvent>((observer) => {
+      const interval = setInterval(() => {
+        const mem = process.memoryUsage();
+        const status = {
+          channels: this.channels.size,
+          clients: this.activeClients.size,
+          heap: Math.round(mem.heapUsed / 1024 / 1024),
+          rss: Math.round(mem.rss / 1024 / 1024),
+        };
+        observer.next({ data: status });
+      }, 1000);
+
+      return () => clearInterval(interval);
+    });
   }
 }
