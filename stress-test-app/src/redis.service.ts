@@ -1,6 +1,10 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
-import { Observable } from 'rxjs';
 import Redis from 'ioredis';
+
+export interface StreamMessage {
+  id: string;
+  data: string;
+}
 
 @Injectable()
 export class RedisService implements OnModuleDestroy {
@@ -14,63 +18,53 @@ export class RedisService implements OnModuleDestroy {
     this.redis = new Redis(config);
   }
 
+  // 새로운 Redis 연결 생성 (스트림 리더용)
+  createReader(): Redis {
+    return this.redis.duplicate();
+  }
+
   // Redis Streams: XADD
   async addToStream(streamKey: string, message: string): Promise<string> {
     const id = await this.redis.xadd(streamKey, '*', 'data', message);
-    return id;
+    return id ?? '';
   }
 
-  // Redis Streams: XREAD (blocking)
-  readStream(streamKey: string): Observable<string> {
-    return new Observable((observer) => {
-      const reader = this.redis.duplicate();
-      let running = true;
-      let lastId = '$'; // 새 메시지만 읽기
+  // Redis Streams: XREAD - 한 번에 하나씩 읽기 (pull 기반)
+  async xreadOne(
+    reader: Redis,
+    streamKey: string,
+    lastId: string,
+    blockMs: number = 5000,
+  ): Promise<StreamMessage | null> {
+    // ioredis 타입 정의 문제로 call 사용
+    const result = (await reader.call(
+      'XREAD',
+      'BLOCK',
+      blockMs.toString(),
+      'COUNT',
+      '1',
+      'STREAMS',
+      streamKey,
+      lastId,
+    )) as [string, [string, string[]][]][] | null;
 
-      const read = async () => {
-        while (running) {
-          try {
-            // XREAD BLOCK 5000: 5초 동안 새 메시지 대기
-            const result = await reader.xread(
-              'BLOCK',
-              5000,
-              'STREAMS',
-              streamKey,
-              lastId,
-            );
-
-            if (result && result.length > 0) {
-              const [, messages] = result[0];
-              for (const [id, fields] of messages) {
-                lastId = id;
-                // fields = ['data', 'actual_message']
-                const dataIndex = fields.indexOf('data');
-                if (dataIndex !== -1) {
-                  observer.next(fields[dataIndex + 1]);
-                }
-              }
-            }
-          } catch (err) {
-            if (running) {
-              observer.error(err);
-            }
-            break;
-          }
+    if (result && result.length > 0) {
+      const [, messages] = result[0];
+      if (messages.length > 0) {
+        const [id, fields] = messages[0];
+        const dataIndex = fields.indexOf('data');
+        if (dataIndex !== -1) {
+          return {
+            id,
+            data: fields[dataIndex + 1],
+          };
         }
-      };
-
-      console.log(`[Redis] Started reading stream: ${streamKey}`);
-      read();
-
-      return () => {
-        console.log(`[Redis] Stopped reading stream: ${streamKey}`);
-        running = false;
-        reader.disconnect();
-      };
-    });
+      }
+    }
+    return null;
   }
 
-  // Pub/Sub 호환용 (요청 전달용)
+  // Pub/Sub (요청 전달용)
   async publish(channel: string, message: string): Promise<void> {
     await this.redis.publish(channel, message);
   }
