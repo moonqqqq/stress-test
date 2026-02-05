@@ -1,6 +1,6 @@
 /**
  * 데이터 폭주 생성기
- * Redis를 통해 대량의 데이터를 빠르게 전송하여 서버 버퍼를 채움
+ * Redis Streams (XADD)를 통해 대량의 데이터를 빠르게 전송
  */
 import Redis from 'ioredis';
 
@@ -13,7 +13,7 @@ const redis = new Redis({
   port: parseInt(process.env.REDIS_PORT || '6379'),
 });
 
-const channel = `llm:response:${SESSION_ID}`;
+const streamKey = `llm:response:${SESSION_ID}`;
 
 // 큰 메시지 생성
 function generateLargeMessage(sizeKB: number): string {
@@ -27,7 +27,7 @@ function generateLargeMessage(sizeKB: number): string {
 let totalSent = 0;
 let totalBytes = 0;
 
-console.log(`[DataFlood] Starting flood to channel: ${channel}`);
+console.log(`[DataFlood] Starting flood to stream: ${streamKey}`);
 console.log(`[DataFlood] Message size: ${MESSAGE_SIZE_KB}KB, Rate: ${MESSAGES_PER_SECOND}/sec`);
 console.log(`[DataFlood] Data rate: ~${(MESSAGE_SIZE_KB * MESSAGES_PER_SECOND / 1024).toFixed(2)} MB/sec`);
 console.log('');
@@ -37,16 +37,21 @@ const messageBytes = Buffer.byteLength(message);
 
 const intervalMs = 1000 / MESSAGES_PER_SECOND;
 
-const interval = setInterval(() => {
-  redis.publish(channel, message);
-  totalSent++;
-  totalBytes += messageBytes;
+const interval = setInterval(async () => {
+  try {
+    // Redis Streams: XADD
+    await redis.xadd(streamKey, '*', 'data', message);
+    totalSent++;
+    totalBytes += messageBytes;
 
-  if (totalSent % 100 === 0) {
-    console.log(
-      `[DataFlood] Sent: ${totalSent} messages, ` +
-        `Total: ${(totalBytes / 1024 / 1024).toFixed(2)} MB`,
-    );
+    if (totalSent % 100 === 0) {
+      console.log(
+        `[DataFlood] Sent: ${totalSent} messages, ` +
+          `Total: ${(totalBytes / 1024 / 1024).toFixed(2)} MB`,
+      );
+    }
+  } catch (err) {
+    console.error('[DataFlood] Error:', err);
   }
 }, intervalMs);
 
