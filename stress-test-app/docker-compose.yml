@@ -62,6 +62,70 @@ services:
     profiles:
       - test
 
+  # 다중 연결 테스트 (연결 수로 OOM 유발)
+  many-connections:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["node", "dist-test/many-connections.js", "2000"]
+    environment:
+      - SERVER_HOST=server
+      - SERVER_PORT=3000
+    depends_on:
+      - server
+    networks:
+      - oom-test
+    profiles:
+      - stress
+
+  # 다중 세션에 데이터 폭주
+  multi-flood:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["node", "dist-test/multi-flood.js", "2000", "50", "10"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - oom-test
+    profiles:
+      - stress
+
+  # 정상 클라이언트 (LLM 스트리밍 테스트)
+  normal-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["node", "dist-test/normal-client.js", "8000"]
+    environment:
+      - SERVER_HOST=server
+      - SERVER_PORT=3000
+    depends_on:
+      - server
+    networks:
+      - oom-test
+    profiles:
+      - llm
+
+  # LLM 응답 시뮬레이터
+  llm-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["node", "dist-test/llm-simulator.js", "8000", "500", "20", "normal-session"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - oom-test
+    profiles:
+      - llm
+
 networks:
   oom-test:
     driver: bridge

@@ -10,6 +10,6 @@ COPY test/*.ts ./test/
 COPY tsconfig.json ./
 
 # 테스트 스크립트 컴파일
-RUN npx tsc test/slow-client.ts test/data-flood.ts --outDir dist-test --esModuleInterop --module commonjs --skipLibCheck
+RUN npx tsc test/slow-client.ts test/data-flood.ts test/many-connections.ts test/multi-flood.ts test/normal-client.ts test/llm-simulator.ts --outDir dist-test --esModuleInterop --module commonjs --skipLibCheck
 
 CMD ["node", "dist-test/slow-client.js"]
