@@ -1,0 +1,15 @@
+# 테스트 클라이언트용 Dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY test/*.ts ./test/
+COPY tsconfig.json ./
+
+# 테스트 스크립트 컴파일
+RUN npx tsc test/slow-client.ts test/data-flood.ts --outDir dist-test --esModuleInterop --module commonjs --skipLibCheck
+
+CMD ["node", "dist-test/slow-client.js"]

@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - oom-test
+
+  # SSE 서버 (메모리 제한)
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - oom-test
+    # 핵심: 컨테이너 메모리 제한 (256MB)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    # docker run에서도 적용되도록
+    mem_limit: 256m
+    memswap_limit: 256m  # swap도 제한하여 OOM 유도
+
+  # 느린 클라이언트 (데이터 소비 안함)
+  slow-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["node", "dist-test/slow-client.js", "oom-test-session"]
+    environment:
+      - SERVER_HOST=server
+      - SERVER_PORT=3000
+    depends_on:
+      - server
+    networks:
+      - oom-test
+    profiles:
+      - test
+
+  # 데이터 폭주 생성기
+  data-flood:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["node", "dist-test/data-flood.js", "oom-test-session", "100", "100"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - oom-test
+    profiles:
+      - test
+
+networks:
+  oom-test:
+    driver: bridge
