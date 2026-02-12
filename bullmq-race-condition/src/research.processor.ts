@@ -1,367 +1,214 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, UnrecoverableError } from 'bullmq';
 import { StreamService } from './stream.service';
+import { FencingTokenManager } from './fencing-token.manager';
 
-/**
- * Job 실행 컨텍스트
- *
- * AbortController와 펜싱 토큰을 함께 관리하여
- * 좀비 프로세스 감지 및 자동 종료를 처리합니다.
- */
+const LOCK_DURATION_MS = 30000;
+const STALLED_INTERVAL_MS = 15000;
+const HEARTBEAT_INTERVAL_MS = 10000;
+const SIMULATION_STEP_DELAY_MS = 2000;
+
 interface JobContext {
-  abortController: AbortController;
-  fencingToken: string;
-  lockExtendInterval: ReturnType<typeof setInterval> | null;
-  isAborted: boolean;
+  jobId: string;
+  token: string;
+  signal: AbortSignal;
 }
 
 @Processor('deep-research', {
-  // 적절한 lock 설정
-  lockDuration: 30000,      // 30초 lock
-  stalledInterval: 15000,   // 15초마다 stalled 체크
-  maxStalledCount: 1,       // 1번만 stalled 허용 (빠른 감지)
-  concurrency: 1,           // 동시 처리 수 (필요에 따라 조정)
+  lockDuration: LOCK_DURATION_MS,
+  stalledInterval: STALLED_INTERVAL_MS,
+  maxStalledCount: 1,
+  concurrency: 1,
 })
 export class ResearchProcessor extends WorkerHost {
-  private readonly instanceId = Math.random().toString(36).substring(7);
+  private readonly workerId = Math.random().toString(36).substring(7);
+  private readonly LLM_SERVER_URL = process.env.LLM_SERVER_URL || '';
 
-  // 활성 job 컨텍스트 관리
-  private activeJobs = new Map<string, JobContext>();
+  // 중복 실행 방지용 (jobId만 추적)
+  private runningJobs = new Set<string>();
 
-  constructor(private readonly streamService: StreamService) {
+  constructor(
+    private readonly streamService: StreamService,
+    private readonly fencingTokenManager: FencingTokenManager,
+  ) {
     super();
-    console.log(`🔧 Worker instance created: ${this.instanceId}`);
+    console.log(`🔧 Worker: ${this.workerId}`);
   }
 
-  /**
-   * 메인 job 처리 함수
-   */
   async process(job: Job<{ query: string; jobId: string }>) {
     const { query, jobId } = job.data;
 
-    // 이미 이 job이 실행 중인지 확인 (중복 실행 방지)
-    if (this.activeJobs.has(jobId)) {
-      console.log(`⚠️ [${this.instanceId}] Job already running: ${jobId}`);
-      throw new UnrecoverableError('Job already running in this worker');
+    if (this.runningJobs.has(jobId)) {
+      throw new UnrecoverableError('Job already running');
     }
+    this.runningJobs.add(jobId);
 
-    // AbortController 생성
     const abortController = new AbortController();
-    const { signal } = abortController;
+    const token = await this.fencingTokenManager.acquire(jobId, this.workerId);
 
-    // 펜싱 토큰 획득 (이전 토큰 자동 무효화)
-    const fencingToken = await this.streamService.acquireFencingToken(
-      jobId,
-      this.instanceId
-    );
+    console.log(`🚀 [${this.workerId}] Start: ${jobId}`);
 
-    // Job 컨텍스트 초기화
-    const context: JobContext = {
-      abortController,
-      fencingToken,
-      lockExtendInterval: null,
-      isAborted: false,
-    };
+    // heartbeat: lock 연장 + 토큰 검증
+    const heartbeatInterval = setInterval(async () => {
+      const lockOk = await this.tryExtendLock(job);
+      if (!lockOk) {
+        abortController.abort();
+        return;
+      }
 
-    this.activeJobs.set(jobId, context);
+      const tokenOk = await this.fencingTokenManager.validate(jobId, token);
+      if (!tokenOk) {
+        console.log(`🚫 [${this.workerId}] Token invalid`);
+        abortController.abort();
+      }
+    }, HEARTBEAT_INTERVAL_MS);
 
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`🚀 [${this.instanceId}] Starting job: ${jobId}`);
-    console.log(`📝 Query: ${query}`);
-    console.log(`⏰ Attempt: ${job.attemptsMade + 1}`);
-    console.log(`🔐 Fencing Token: ${fencingToken.substring(0, 8)}...`);
-    console.log(`${'='.repeat(60)}\n`);
+    const ctx: JobContext = { jobId, token, signal: abortController.signal };
 
     try {
-      // Lock 자동 갱신 + 토큰 검증 시작 (10초마다)
-      context.lockExtendInterval = this.startLockExtension(job, jobId, signal, context);
+      await this.publish(ctx, 'started', { attempt: job.attemptsMade + 1 });
 
-      // 시작 알림
-      if (!context.isAborted) {
-        await this.streamService.publish(jobId, {
-          status: 'started',
-          workerId: this.instanceId,
-          attempt: job.attemptsMade + 1,
-          timestamp: new Date().toISOString(),
-        }, context.fencingToken);
-      }
+      const result = await this.executeResearch(query, ctx);
 
-      // 작업 수행
-      const result = await this.executeResearch(job, jobId, query, context, signal);
+      await this.publish(ctx, 'completed', { query, summary: result.summary });
+      await this.fencingTokenManager.release(jobId, token);
 
-      // 완료 알림
-      if (!context.isAborted) {
-        await this.streamService.publish(jobId, {
-          status: 'completed',
-          workerId: this.instanceId,
-          query,
-          summary: result.summary,
-          timestamp: new Date().toISOString(),
-        }, context.fencingToken);
-      }
-
-      // 펜싱 토큰 해제
-      await this.streamService.releaseFencingToken(jobId, fencingToken);
-
-      console.log(`\n✅ [${this.instanceId}] Job completed: ${jobId}\n`);
-
+      console.log(`✅ [${this.workerId}] Done: ${jobId}`);
       return result;
+
     } catch (error) {
-      // Abort로 인한 에러인지 확인
-      if (signal.aborted || context.isAborted) {
-        console.log(`🛑 [${this.instanceId}] Job aborted: ${jobId}`);
-
-        // 좀비 프로세스이므로 에러를 발행하지 않음
-        throw new UnrecoverableError('Job was aborted - zombie process terminated');
+      if (ctx.signal.aborted) {
+        console.log(`🧟 [${this.workerId}] Zombie terminated: ${jobId}`);
+        throw new UnrecoverableError('Zombie terminated');
       }
 
-      // 실제 에러 처리
-      console.error(`❌ [${this.instanceId}] Job failed: ${jobId}`, error);
-
-      if (!context.isAborted) {
-        await this.streamService.publish(jobId, {
-          status: 'error',
-          workerId: this.instanceId,
-          error: error instanceof Error ? error.message : 'Unknown error',
-          timestamp: new Date().toISOString(),
-        }, context.fencingToken);
-      }
-
+      await this.publish(ctx, 'error', {
+        error: error instanceof Error ? error.message : 'Unknown',
+      });
       throw error;
+
     } finally {
-      // 정리 작업
-      this.cleanupJob(jobId);
+      clearInterval(heartbeatInterval);
+      this.runningJobs.delete(jobId);
     }
   }
 
-  // LLM 서버 URL (환경변수로 설정)
-  private readonly LLM_SERVER_URL = process.env.LLM_SERVER_URL || '';
+  // --- 단일 책임 함수들 ---
 
-  /**
-   * 연구 작업 수행 - LLM 서버 호출
-   */
+  /** lock 연장만 수행. 성공 여부 반환 */
+  private async tryExtendLock(job: Job): Promise<boolean> {
+    try {
+      await job.extendLock(job.token!, LOCK_DURATION_MS);
+      return true;
+    } catch {
+      console.error(`⚠️ [${this.workerId}] Lock extend failed`);
+      return false;
+    }
+  }
+
+  /** 스트림 발행 (abort 시 throw) */
+  private async publish(
+    ctx: JobContext,
+    status: string,
+    data: Record<string, any> = {}
+  ): Promise<void> {
+    if (ctx.signal.aborted) throw new UnrecoverableError('Aborted');
+
+    await this.streamService.publish(ctx.jobId, {
+      status,
+      workerId: this.workerId,
+      timestamp: new Date().toISOString(),
+      ...data,
+    }, ctx.token);
+  }
+
+  /** 인터럽트 가능한 딜레이 */
+  private delay(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, ms);
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new UnrecoverableError('Aborted'));
+      }, { once: true });
+    });
+  }
+
+  // --- 비즈니스 로직 ---
+
   private async executeResearch(
-    job: Job,
-    jobId: string,
     query: string,
-    context: JobContext,
-    signal: AbortSignal
+    ctx: JobContext
   ): Promise<{ summary: string }> {
-    // LLM 서버 URL이 없으면 시뮬레이션 모드
-    if (!this.LLM_SERVER_URL) {
-      return this.executeResearchSimulation(job, jobId, query, context, signal);
+    if (this.LLM_SERVER_URL) {
+      return this.callLLM(query, ctx);
     }
-
-    // 실제 LLM 서버 호출
-    return this.callLLMServer(job, jobId, query, context, signal);
+    return this.simulate(query, ctx);
   }
 
-  /**
-   * 실제 LLM 서버 호출 (SSE 스트림)
-   */
-  private async callLLMServer(
-    job: Job,
-    jobId: string,
+  private async callLLM(
     query: string,
-    context: JobContext,
-    signal: AbortSignal
+    ctx: JobContext
   ): Promise<{ summary: string }> {
-    console.log(`🌐 [${this.instanceId}] Calling LLM server: ${this.LLM_SERVER_URL}`);
-
     const response = await fetch(this.LLM_SERVER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, jobId }),
-      signal,  // abort() 호출 시 요청 취소됨
+      body: JSON.stringify({ query, jobId: ctx.jobId }),
+      signal: ctx.signal,
     });
 
-    if (!response.ok) {
-      throw new Error(`LLM server error: ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`LLM error: ${response.status}`);
 
     const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('No response body');
-    }
+    if (!reader) throw new Error('No body');
 
     const decoder = new TextDecoder();
     let summary = '';
 
     try {
       while (true) {
-        // abort 체크
-        this.checkAborted(signal, context);
-
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n').filter(line => line.startsWith('data: '));
-
-        for (const line of lines) {
+        for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+          if (!line.startsWith('data: ')) continue;
           const data = JSON.parse(line.slice(6));
 
-          console.log(`📍 [${this.instanceId}] LLM progress: ${data.percent}%`);
+          await this.publish(ctx, 'progress', {
+            percent: data.percent,
+            message: data.message,
+          });
 
-          // 진행 상황 발행
-          if (!context.isAborted) {
-            await this.streamService.publish(jobId, {
-              status: 'progress',
-              workerId: this.instanceId,
-              percent: data.percent,
-              message: data.message,
-              timestamp: new Date().toISOString(),
-            }, context.fencingToken);
-          }
-
-          // BullMQ 진행률 업데이트
-          await job.updateProgress(data.percent);
-
-          if (data.summary) {
-            summary = data.summary;
-          }
+          if (data.summary) summary = data.summary;
         }
       }
     } finally {
       reader.releaseLock();
     }
 
-    return { summary: summary || `Research completed for: ${query}` };
+    return { summary: summary || `Done: ${query}` };
   }
 
-  /**
-   * 시뮬레이션 모드 (LLM 서버 없을 때)
-   */
-  private async executeResearchSimulation(
-    job: Job,
-    jobId: string,
+  private async simulate(
     query: string,
-    context: JobContext,
-    signal: AbortSignal
+    ctx: JobContext
   ): Promise<{ summary: string }> {
-    console.log(`🔬 [${this.instanceId}] Simulation mode (no LLM_SERVER_URL)`);
-
     const steps = [
-      { percent: 10, message: '문서 수집 중...' },
-      { percent: 25, message: '1차 분석 중...' },
-      { percent: 50, message: '심층 분석 중...' },
-      { percent: 75, message: '결과 종합 중...' },
-      { percent: 90, message: '보고서 작성 중...' },
+      { percent: 10, message: '수집 중...' },
+      { percent: 25, message: '1차 분석...' },
+      { percent: 50, message: '심층 분석...' },
+      { percent: 75, message: '종합 중...' },
+      { percent: 90, message: '작성 중...' },
       { percent: 100, message: '완료' },
     ];
 
     for (const step of steps) {
-      // Abort 체크
-      this.checkAborted(signal, context);
-
-      console.log(`📍 [${this.instanceId}] Progress: ${step.percent}% - ${step.message}`);
-
-      // 진행 상황 발행
-      if (!context.isAborted) {
-        await this.streamService.publish(jobId, {
-          status: 'progress',
-          workerId: this.instanceId,
-          percent: step.percent,
-          message: step.message,
-          timestamp: new Date().toISOString(),
-        }, context.fencingToken);
-      }
-
-      // BullMQ 진행률 업데이트
-      await job.updateProgress(step.percent);
-
-      // 작업 시뮬레이션 (2초 대기, abort 가능)
-      await this.interruptibleDelay(2000, signal);
+      await this.publish(ctx, 'progress', {
+        percent: step.percent,
+        message: step.message,
+      });
+      await this.delay(SIMULATION_STEP_DELAY_MS, ctx.signal);
     }
 
-    return { summary: `Research completed for: ${query}` };
-  }
-
-  /**
-   * Lock 자동 갱신 + 펜싱 토큰 검증 (10초마다)
-   */
-  private startLockExtension(
-    job: Job,
-    jobId: string,
-    signal: AbortSignal,
-    context: JobContext
-  ): ReturnType<typeof setInterval> {
-    const interval = setInterval(async () => {
-      if (signal.aborted) {
-        clearInterval(interval);
-        return;
-      }
-
-      try {
-        // 1. Lock 연장
-        await job.extendLock(job.token!, 30000);
-        console.log(`🔄 [${this.instanceId}] Lock extended for: ${jobId}`);
-
-        // 2. 펜싱 토큰 검증 (Lock 갱신 시점에만 수행)
-        const isValid = await this.streamService.validateFencingToken(
-          jobId,
-          context.fencingToken
-        );
-
-        if (!isValid) {
-          console.log(`🚫 [${this.instanceId}] Fencing token invalidated: ${jobId}`);
-          this.abortJob(jobId, 'Fencing token invalidated');
-        }
-      } catch (error) {
-        console.error(`⚠️ [${this.instanceId}] Failed to extend lock:`, error);
-        this.abortJob(jobId, 'Failed to extend lock');
-      }
-    }, 10000); // 10초마다 갱신 + 검증
-
-    return interval;
-  }
-
-  /**
-   * Job 중단 (좀비 프로세스 종료)
-   */
-  private abortJob(jobId: string, reason: string) {
-    const context = this.activeJobs.get(jobId);
-    if (context && !context.isAborted) {
-      console.log(`🛑 [${this.instanceId}] Aborting job: ${jobId} - ${reason}`);
-      context.isAborted = true;
-      context.abortController.abort();
-    }
-  }
-
-  /**
-   * Abort 상태 체크
-   */
-  private checkAborted(signal: AbortSignal, context: JobContext) {
-    if (signal.aborted || context.isAborted) {
-      throw new UnrecoverableError('Job was aborted');
-    }
-  }
-
-  /**
-   * 인터럽트 가능한 딜레이
-   */
-  private interruptibleDelay(ms: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(resolve, ms);
-
-      signal.addEventListener('abort', () => {
-        clearTimeout(timeout);
-        reject(new UnrecoverableError('Delay interrupted by abort'));
-      }, { once: true });
-    });
-  }
-
-  /**
-   * Job 정리
-   */
-  private cleanupJob(jobId: string) {
-    const context = this.activeJobs.get(jobId);
-    if (context) {
-      if (context.lockExtendInterval) {
-        clearInterval(context.lockExtendInterval);
-      }
-      this.activeJobs.delete(jobId);
-      console.log(`🧹 [${this.instanceId}] Cleaned up job context: ${jobId}`);
-    }
+    return { summary: `Done: ${query}` };
   }
 }

@@ -1,7 +1,7 @@
 import { Controller, Post, Body, Get, Param, Sse } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { Observable, filter } from 'rxjs';
+import { Observable } from 'rxjs';
 import { StreamService } from './stream.service';
 
 @Controller('research')
@@ -63,29 +63,20 @@ export class ResearchController {
   @Sse('stream/:jobId')
   streamResults(@Param('jobId') jobId: string): Observable<MessageEvent> {
     return new Observable((subscriber) => {
-      // 현재 유효한 펜싱 토큰 추적
       let currentFencingToken: string | null = null;
 
-      this.streamService.subscribe(jobId, (data) => {
-        // 펜싱 토큰 기반 필터링
+      const unsubscribe = this.streamService.subscribe(jobId, (data) => {
         if (data.fencingToken && data.fencingToken !== 'none') {
-          // 첫 번째 토큰이거나 같은 토큰인 경우만 허용
           if (!currentFencingToken) {
             currentFencingToken = data.fencingToken;
           } else if (data.fencingToken !== currentFencingToken) {
-            // 새로운 토큰 = 새로운 worker가 job을 가져감
-            // 이전 데이터는 무시하고 새 토큰으로 갱신
-            console.log(
-              `🔄 Stream: New fencing token detected, switching from ${currentFencingToken} to ${data.fencingToken}`
-            );
+            console.log(`🔄 Stream: Token changed to ${data.fencingToken}`);
             currentFencingToken = data.fencingToken;
 
-            // 클라이언트에 리셋 알림 (선택적)
             subscriber.next({
               data: JSON.stringify({
                 status: 'reset',
-                message: 'New worker took over, previous progress discarded',
-                newFencingToken: data.fencingToken,
+                message: 'New worker took over',
               }),
             } as MessageEvent);
           }
@@ -97,6 +88,9 @@ export class ResearchController {
           subscriber.complete();
         }
       });
+
+      // 클라이언트 연결 종료 시 구독 해제
+      return () => unsubscribe();
     });
   }
 

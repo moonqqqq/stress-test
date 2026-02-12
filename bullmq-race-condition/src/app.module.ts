@@ -3,13 +3,17 @@ import { BullModule } from '@nestjs/bullmq';
 import { ResearchController } from './research.controller';
 import { ResearchProcessor } from './research.processor';
 import { StreamService } from './stream.service';
+import { FencingTokenManager } from './fencing-token.manager';
+
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
+const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
 
 @Module({
   imports: [
     BullModule.forRoot({
       connection: {
-        host: 'localhost',
-        port: 6379,
+        host: REDIS_HOST,
+        port: REDIS_PORT,
       },
     }),
     BullModule.registerQueue({
@@ -24,6 +28,6 @@ import { StreamService } from './stream.service';
     }),
   ],
   controllers: [ResearchController],
-  providers: [ResearchProcessor, StreamService],
+  providers: [ResearchProcessor, StreamService, FencingTokenManager],
 })
 export class AppModule {}
