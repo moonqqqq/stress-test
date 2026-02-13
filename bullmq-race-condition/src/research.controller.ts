@@ -63,16 +63,14 @@ export class ResearchController {
   @Sse('stream/:jobId')
   streamResults(@Param('jobId') jobId: string): Observable<MessageEvent> {
     return new Observable((subscriber) => {
-      let currentFencingToken: string | null = null;
+      let currentFencingToken: number = 0;
 
       const unsubscribe = this.streamService.subscribe(jobId, (data) => {
-        if (data.fencingToken && data.fencingToken !== 'none') {
-          if (!currentFencingToken) {
-            currentFencingToken = data.fencingToken;
-          } else if (data.fencingToken !== currentFencingToken) {
-            console.log(`🔄 Stream: Token changed to ${data.fencingToken}`);
-            currentFencingToken = data.fencingToken;
+        const incomingToken = data.fencingToken ?? 0;
 
+        if (incomingToken > currentFencingToken) {
+          if (currentFencingToken > 0) {
+            console.log(`🔄 Stream: Token changed ${currentFencingToken} → ${incomingToken}`);
             subscriber.next({
               data: JSON.stringify({
                 status: 'reset',
@@ -80,6 +78,13 @@ export class ResearchController {
               }),
             } as MessageEvent);
           }
+          currentFencingToken = incomingToken;
+        }
+
+        // 현재 토큰보다 오래된 데이터는 무시
+        if (incomingToken < currentFencingToken) {
+          console.log(`🚫 Stream: Ignoring stale token ${incomingToken} < ${currentFencingToken}`);
+          return;
         }
 
         subscriber.next({ data: JSON.stringify(data) } as MessageEvent);

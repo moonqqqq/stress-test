@@ -7,7 +7,7 @@ const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
 interface StreamData {
   status: string;
   workerId: string;
-  fencingToken?: string;
+  fencingToken?: number;
   [key: string]: any;
 }
 
@@ -37,12 +37,12 @@ export class StreamService implements OnModuleInit, OnModuleDestroy {
   /**
    * 스트림에 데이터 발행
    */
-  async publish(jobId: string, data: StreamData, fencingToken?: string): Promise<void> {
+  async publish(jobId: string, data: StreamData, fencingToken?: number): Promise<void> {
     const streamKey = `research:${jobId}`;
 
     const enrichedData = {
       ...data,
-      fencingToken: fencingToken ? fencingToken.substring(0, 8) : 'none',
+      fencingToken: fencingToken ?? 0,
     };
 
     console.log(
@@ -100,10 +100,10 @@ export class StreamService implements OnModuleInit, OnModuleDestroy {
   async getValidHistory(jobId: string): Promise<any[]> {
     const history = await this.getHistory(jobId);
 
-    const tokenGroups = new Map<string, any[]>();
+    const tokenGroups = new Map<number, any[]>();
 
     for (const entry of history) {
-      const token = entry.fencingToken || 'none';
+      const token = entry.fencingToken ?? 0;
       if (!tokenGroups.has(token)) {
         tokenGroups.set(token, []);
       }
@@ -117,8 +117,8 @@ export class StreamService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // 없으면 최신 토큰 그룹
-    const tokens = Array.from(tokenGroups.keys()).sort().reverse();
+    // 없으면 최신 토큰 그룹 (숫자 내림차순)
+    const tokens = Array.from(tokenGroups.keys()).sort((a, b) => b - a);
     return tokens.length > 0 ? tokenGroups.get(tokens[0])! : [];
   }
 

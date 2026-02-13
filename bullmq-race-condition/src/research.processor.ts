@@ -10,7 +10,7 @@ const SIMULATION_STEP_DELAY_MS = 2000;
 
 interface JobContext {
   jobId: string;
-  token: string;
+  token: number;
   signal: AbortSignal;
 }
 
@@ -44,7 +44,7 @@ export class ResearchProcessor extends WorkerHost {
     this.runningJobs.add(jobId);
 
     const abortController = new AbortController();
-    const token = await this.fencingTokenManager.acquire(jobId, this.workerId);
+    const token = await this.fencingTokenManager.acquire(jobId);
 
     console.log(`🚀 [${this.workerId}] Start: ${jobId}`);
 
